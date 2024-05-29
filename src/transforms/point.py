@@ -11,8 +11,195 @@ from src.data import NAG
 __all__ = [
     'PointFeatures', 'GroundElevation', 'RoomPosition', 'ColorAutoContrast',
     'NAGColorAutoContrast', 'ColorDrop', 'NAGColorDrop', 'ColorNormalize',
-    'NAGColorNormalize']
+    'NAGColorNormalize', 'PointFeaturesGS']
 
+class PointFeaturesGS(Transform):
+    """Compute pointwise features based on what is already available in
+    the Data object.
+
+    All local geometric features assume the input ``Data`` has a
+    ``neighbors`` attribute, holding a ``(num_nodes, k)`` tensor of
+    indices. All k neighbors will be used for local geometric features
+    computation, unless some are missing (indicated by -1 indices). If
+    the latter, only positive indices will be used.
+
+    The supported feature keys are the following:
+      - rgb: RGB color. Assumes Data.rgb holds either [0, 1] floats or
+        [0, 255] integers
+      - hsv: HSV color. Assumes Data.rgb holds either [0, 1] floats or
+        [0, 255] integers
+      - lab: LAB color. Assumes Data.rgb holds either [0, 1] floats or
+        [0, 255] integers
+      - density: local density. Assumes ``Data.neighbor_index`` and
+        ``Data.neighbor_distance``
+      - linearity: local linearity. Assumes ``Data.neighbor_index``
+      - planarity: local planarity. Assumes ``Data.neighbor_index``
+      - scattering: local scattering. Assumes ``Data.neighbor_index``
+      - verticality: local verticality. Assumes ``Data.neighbor_index``
+      - normal: local normal. Assumes ``Data.neighbor_index``
+      - length: local length. Assumes ``Data.neighbor_index``
+      - surface: local surface. Assumes ``Data.neighbor_index``
+      - volume: local volume. Assumes ``Data.neighbor_index``
+      - curvature: local curvature. Assumes ``Data.neighbor_index``
+
+    :param keys: List(str)
+        Features to be computed. Attributes will be saved under `<key>`
+    :param overwrite: bool
+        When False, attributes of the input Data which are in `keys`
+        will not be updated with the here-computed features. An
+        exception to this rule is 'rgb' for which we always enforce
+        [0, 1] float encoding
+    """
+
+    def __init__(
+            self,
+            keys=None,
+            gs_path="/workspace/gaussian_splatting/output",
+            overwrite=True):
+        self.keys = sanitize_keys(keys, default=POINT_FEATURES)
+        self.gs_path = gs_path
+        self.overwrite = overwrite
+
+    def _process(self, data):
+        assert data.has_neighbors, \
+            "Data is expected to have a 'neighbor_index' attribute"
+        assert data.num_nodes < np.iinfo(np.uint32).max, \
+            "Too many nodes for `uint32` indices"
+        assert data.neighbor_index.max() < np.iinfo(np.uint32).max, \
+            "Too high 'neighbor_index' indices for `uint32` indices"
+
+        # Build the set of keys that must be computed/updated. In
+        # particular, if `overwrite=False`, we do not modify
+        # already-existing keys in the input Data. With the exception of
+        # 'rgb', for which we always enforce [0, 1] float encoding
+        keys = set(self.keys) if self.overwrite \
+            else set(self.keys) - set(data.keys)
+
+        # Add RGB to the features. If colors are stored in int, we
+        # assume they are encoded in  [0, 255] and normalize them.
+        # Otherwise, we assume they have already been [0, 1] normalized
+        # NB: we ignore 'overwrite' for this key
+        if 'rgb' in self.keys and data.rgb is not None:
+            data.rgb = to_float_rgb(data.rgb)
+
+        # Add HSV to the features. If colors are stored in int, we
+        # assume they are encoded in  [0, 255] and normalize them.
+        # Otherwise, we assume they have already been [0, 1] normalized.
+        # Note: for all features to live in a similar range, we
+        # normalize H in [0, 1]
+        if 'hsv' in keys and data.rgb is not None:
+            hsv = rgb2hsv(to_float_rgb(data.rgb))
+            hsv[:, 0] /= 360.
+            data.hsv = hsv
+
+        # Add LAB to the features. If colors are stored in int, we
+        # assume they are encoded in  [0, 255] and normalize them.
+        # Otherwise, we assume they have already been [0, 1] normalized.
+        # Note: for all features to live in a similar range, we
+        # normalize L in [0, 1] and ab in [-1, 1]
+        if 'lab' in keys and data.rgb is not None:
+            data.lab = rgb2lab(to_float_rgb(data.rgb)) / 100
+
+        # Add local surfacic density to the features. The local density
+        # is approximated as K / D² where K is the number of nearest
+        # neighbors and D is the distance of the Kth neighbor. We
+        # normalize by D² since points roughly lie on a 2D manifold.
+        # Note that this takes into account partial neighborhoods where
+        # -1 indicates absent neighbors
+        if 'density' in keys:
+            dmax = data.neighbor_distance.max(dim=1).values
+            k = data.neighbor_index.ge(0).sum(dim=1)
+            data.density = (k / dmax ** 2).view(-1, 1)
+
+        # Add local geometric features
+        needs_geof = any((
+            'linearity' in keys,
+            'planarity' in keys,
+            'scattering' in keys,
+            'verticality' in keys,
+            'normal' in keys))
+        if needs_geof and data.pos is not None:
+
+            # Prepare data for numpy boost interface. Note: we add each
+            # point to its own neighborhood before computation
+            device = data.pos.device
+            xyz = data.pos.cpu().numpy()
+            nn = torch.cat(
+                (torch.arange(xyz.shape[0]).view(-1, 1), data.neighbor_index),
+                dim=1)
+            k = nn.shape[1]
+
+            # Check for missing neighbors (indicated by -1 indices)
+            n_missing = (nn < 0).sum(dim=1)
+            if (n_missing > 0).any():
+                sizes = k - n_missing
+                nn = nn[nn >= 0]
+                nn_ptr = sizes_to_pointers(sizes.cpu())
+            else:
+                nn = nn.flatten().cpu()
+                nn_ptr = torch.arange(xyz.shape[0] + 1) * k
+            nn = nn.numpy().astype('uint32')
+            nn_ptr = nn_ptr.numpy().astype('uint32')
+
+            # Make sure array are contiguous before moving to C++
+            xyz = np.ascontiguousarray(xyz)
+            nn = np.ascontiguousarray(nn)
+            nn_ptr = np.ascontiguousarray(nn_ptr)
+
+            # C++ geometric features computation on CPU
+            # if self.k_step < 0:
+            #     f = pgeof.compute_features(
+            #         xyz, 
+            #         nn, 
+            #         nn_ptr, 
+            #         self.k_min, 
+            #         verbose=False)
+            # else:
+            #     f = pgeof.compute_features_optimal(
+            #         xyz,
+            #         nn,
+            #         nn_ptr,
+            #         self.k_min,
+            #         self.k_step,
+            #         self.k_min_search,
+            #         verbose=False)
+            f = torch.from_numpy(f)
+
+            # Keep only required features
+            if 'linearity' in keys:
+                data.linearity = f[:, 0].view(-1, 1).to(device)
+
+            if 'planarity' in keys:
+                data.planarity = f[:, 1].view(-1, 1).to(device)
+
+            if 'scattering' in keys:
+                data.scattering = f[:, 2].view(-1, 1).to(device)
+
+            # Heuristic to increase importance of verticality in
+            # partition
+            if 'verticality' in keys:
+                data.verticality = f[:, 3].view(-1, 1).to(device)
+                data.verticality *= 2
+
+            if 'curvature' in keys:
+                data.curvature = f[:, 10].view(-1, 1).to(device)
+
+            if 'length' in keys:
+                data.length = f[:, 7].view(-1, 1).to(device)
+
+            if 'surface' in keys:
+                data.surface = f[:, 8].view(-1, 1).to(device)
+
+            if 'volume' in keys:
+                data.volume = f[:, 9].view(-1, 1).to(device)
+
+            # As a way to "stabilize" the normals' orientation, we
+            # choose to express them as oriented in the z+ half-space
+            if 'normal' in keys:
+                data.normal = f[:, 4:7].view(-1, 3).to(device)
+                data.normal[data.normal[:, 2] < 0] *= -1
+
+        return data
 
 class PointFeatures(Transform):
     """Compute pointwise features based on what is already available in
