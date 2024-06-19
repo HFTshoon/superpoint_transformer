@@ -18,21 +18,29 @@ pc_tiling: null
 
 # point features used for the partition
 partition_hf:
-  - 'hsv'
   - 'linearity'
   - 'planarity'
   - 'scattering'
   - 'verticality'
-  - 'elevation'
+  - 'curvature'
+  - 'length'
+  - 'volume'
+  - 'normal'
+  - 'f_dc'
+  - 'f_rest'
 
 # point features used for training
 point_hf:
-  - 'hsv'
   - 'linearity'
   - 'planarity'
   - 'scattering'
   - 'verticality'
-  - 'elevation'
+  - 'curvature'
+  - 'length'
+  - 'volume'
+  - 'normal'
+  - 'f_dc'
+  - 'f_rest'
 
 # segment-wise features computed at preprocessing
 segment_base_hf: []
@@ -69,8 +77,6 @@ knn: 50
 knn_r: 10
 knn_step: -1
 knn_min_search: 25
-ground_threshold: 5
-ground_scale: 20
 pcp_regularization: [0.1, 0.2, 0.6]
 pcp_spatial_weight: [1, 1e-1, 1e-2]
 pcp_cutoff: [10, 30, 100]
@@ -138,10 +144,10 @@ pre_transform:
     - transform: DataTo
       params:
         device: 'cpu'
-    - transform: GroundElevation
-      params:
-        threshold: ${datamodule.ground_threshold}
-        scale: ${datamodule.ground_scale}
+    # - transform: GroundElevation
+    #   params:
+    #     threshold: ${datamodule.ground_threshold}
+    #     scale: ${datamodule.ground_scale}
     - transform: PointFeaturesGS
       params:
         keys: ${datamodule.point_hf_preprocess}

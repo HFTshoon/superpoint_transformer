@@ -60,12 +60,14 @@ def read_kitti360gs_window(
     data = Data()
     
     use_gs = True
-    use_gs_with_den = False
+    use_gs_with_den = True
     scene_name = os.path.basename(filepath).split(".")[0]
     if use_gs_with_den:
-        gs_path = f"/workspace/gaussian-splatting/output/{scene_name}_2/point_cloud/iteration_30000/point_cloud.ply"
+        gs_path = f"/workspace/gaussian-splatting/output/{scene_name}_4/point_cloud/iteration_30000/point_cloud.ply"
     else:
         gs_path = f"/workspace/gaussian-splatting/output/{scene_name}_3/point_cloud/iteration_30000/point_cloud.ply"
+    print(gs_path)
+    print(filepath)
         
     if scene_name.endswith("val") or scene_name.endswith("test"):
         use_gs = False
@@ -73,8 +75,9 @@ def read_kitti360gs_window(
     with open(filepath, "rb") as f:
         window = PlyData.read(f)
         attributes = [p.name for p in window['vertex'].properties]
+        print(attributes)
 
-        if xyz:
+        if not use_gs_with_den and xyz:
             pos = torch.stack([
                 torch.from_numpy(np.ascontiguousarray(window["vertex"][axis])).float()
                 # torch.FloatTensor(window["vertex"][axis])
@@ -83,11 +86,11 @@ def read_kitti360gs_window(
             data.pos = pos - pos_offset
             data.pos_offset = pos_offset
 
-        if rgb:
-            data.rgb = to_float_rgb(torch.stack([
-                torch.from_numpy(np.ascontiguousarray(window["vertex"][axis])).float()
-                # torch.FloatTensor(window["vertex"][axis])
-                for axis in ["red", "green", "blue"]], dim=-1))
+        # if rgb:
+        #     data.rgb = to_float_rgb(torch.stack([
+        #         torch.from_numpy(np.ascontiguousarray(window["vertex"][axis])).float()
+        #         # torch.FloatTensor(window["vertex"][axis])
+        #         for axis in ["red", "green", "blue"]], dim=-1))
 
         if semantic and 'semantic' in attributes:
             y = torch.LongTensor(window["vertex"]['semantic'])
@@ -107,6 +110,16 @@ def read_kitti360gs_window(
         if use_gs:
             with open(gs_path, "rb") as f:
                 gs_window = PlyData.read(f)
+
+                if use_gs_with_den and xyz:
+                    pos = torch.stack([
+                        torch.from_numpy(np.ascontiguousarray(gs_window["vertex"][axis])).float()
+                        # torch.FloatTensor(window["vertex"][axis])
+                        for axis in ["x", "y", "z"]], dim=-1)
+                    pos_offset = pos[0]
+                    data.pos = pos - pos_offset
+                    data.pos_offset = pos_offset
+
                 f_dc_names = [p.name for p in gs_window.elements[0].properties if p.name.startswith("f_dc_")]
                 f_dc_names = sorted(f_dc_names, key = lambda x: int(x.split('_')[-1]))
                 f_rest_names = [p.name for p in gs_window.elements[0].properties if p.name.startswith("f_rest_")]
