@@ -152,3 +152,8 @@ feat_size:
     centroid_dir: 3
     centroid_dist: 1
     normal_angle: 1
+
+    f_dc: 3
+    f_rest: 45
+    scales: 3
+    rots: 4

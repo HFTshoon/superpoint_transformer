@@ -473,6 +473,10 @@ class NAG:
         # Local import to avoid import loop errors
         from src.visualization import show
         return show(self, **kwargs)
+    
+    def show_simple(self, **kwargs):
+        from src.visualization import show_simple
+        return show_simple(self, **kwargs)
 
 
 class NAGBatch(NAG):

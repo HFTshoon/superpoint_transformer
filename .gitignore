@@ -1,3 +1,9 @@
+*.zip
+supergaussians_demo
+supergaussians_ori
+supergaussians_no_f
+supergaussians_f
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

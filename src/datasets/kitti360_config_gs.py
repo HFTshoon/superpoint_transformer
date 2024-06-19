@@ -26,9 +26,9 @@ UNZIP_NAME = 'data_3d_semantics'
 #   - 'data_3d_semantics/2013_05_28_drive_train.txt'
 #   - 'data_3d_semantics/2013_05_28_drive_val.txt'
 WINDOWS = {
-    'train': ['scenes/fox', 'scenes/counter', 'scenes/room'],
-    'val': ['scenes/fox'],
-    'test': ['scenes/fox']
+    'train': ['scenes/bicycle', 'scenes/bonsai', 'scenes/counter', 'scenes/fox', 'scenes/garden', 'scenes/kitchen', 'scenes/room', 'scenes/stump'],
+    'val': ['scenes/fox_val'],
+    'test': ['scenes/fox_test']
     }
 
 SEQUENCES = {

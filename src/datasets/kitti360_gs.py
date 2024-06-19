@@ -37,7 +37,7 @@ __all__ = ['KITTI360GS', 'MiniKITTI360GS']
 #                                 Utils                                #
 ########################################################################
 
-def read_kitti360_window(
+def read_kitti360gs_window(
         filepath, xyz=True, rgb=True, semantic=True, instance=True,
         remap=False):
     """Read a KITTI-360 window –i.e. a tile– saved as PLY.
@@ -58,13 +58,26 @@ def read_kitti360_window(
         https://github.com/autonomousvision/kitti360Scripts/blob/master/kitti360scripts/evaluation/semantic_3d/evalPointLevelSemanticLabeling.py
     """
     data = Data()
+    
+    use_gs = True
+    use_gs_with_den = False
+    scene_name = os.path.basename(filepath).split(".")[0]
+    if use_gs_with_den:
+        gs_path = f"/workspace/gaussian-splatting/output/{scene_name}_2/point_cloud/iteration_30000/point_cloud.ply"
+    else:
+        gs_path = f"/workspace/gaussian-splatting/output/{scene_name}_3/point_cloud/iteration_30000/point_cloud.ply"
+        
+    if scene_name.endswith("val") or scene_name.endswith("test"):
+        use_gs = False
+    
     with open(filepath, "rb") as f:
         window = PlyData.read(f)
         attributes = [p.name for p in window['vertex'].properties]
 
         if xyz:
             pos = torch.stack([
-                torch.FloatTensor(window["vertex"][axis])
+                torch.from_numpy(np.ascontiguousarray(window["vertex"][axis])).float()
+                # torch.FloatTensor(window["vertex"][axis])
                 for axis in ["x", "y", "z"]], dim=-1)
             pos_offset = pos[0]
             data.pos = pos - pos_offset
@@ -72,7 +85,8 @@ def read_kitti360_window(
 
         if rgb:
             data.rgb = to_float_rgb(torch.stack([
-                torch.FloatTensor(window["vertex"][axis])
+                torch.from_numpy(np.ascontiguousarray(window["vertex"][axis])).float()
+                # torch.FloatTensor(window["vertex"][axis])
                 for axis in ["red", "green", "blue"]], dim=-1))
 
         if semantic and 'semantic' in attributes:
@@ -89,6 +103,36 @@ def read_kitti360_window(
             y = torch.LongTensor(window["vertex"]['semantic'])
             y = torch.from_numpy(ID2TRAINID)[y] if remap else y
             data.obj = InstanceData(idx, obj, count, y, dense=True)
+            
+        if use_gs:
+            with open(gs_path, "rb") as f:
+                gs_window = PlyData.read(f)
+                f_dc_names = [p.name for p in gs_window.elements[0].properties if p.name.startswith("f_dc_")]
+                f_dc_names = sorted(f_dc_names, key = lambda x: int(x.split('_')[-1]))
+                f_rest_names = [p.name for p in gs_window.elements[0].properties if p.name.startswith("f_rest_")]
+                f_rest_names = sorted(f_rest_names, key = lambda x: int(x.split('_')[-1]))
+                scales_names = [p.name for p in gs_window.elements[0].properties if p.name.startswith("scale_")]
+                scales_names = sorted(scales_names, key = lambda x: int(x.split('_')[-1]))
+                rot_names = [p.name for p in gs_window.elements[0].properties if p.name.startswith("rot_")]
+                rot_names = sorted(rot_names, key = lambda x: int(x.split('_')[-1]))
+                
+                data.f_dc = torch.stack([
+                    torch.from_numpy(np.ascontiguousarray(gs_window["vertex"][axis])).float()
+                    for axis in f_dc_names], dim=-1)
+                
+                data.f_rest = torch.stack([
+                    torch.from_numpy(np.ascontiguousarray(gs_window["vertex"][axis])).float()
+                    for axis in f_rest_names], dim=-1)
+
+                scales = torch.stack([
+                    torch.from_numpy(np.ascontiguousarray(gs_window["vertex"][axis])).float()
+                    for axis in scales_names], dim=-1)
+                data.scales = torch.exp(scales)
+                
+                rots = torch.stack([
+                    torch.from_numpy(np.ascontiguousarray(gs_window["vertex"][axis])).float()
+                    for axis in rot_names], dim=-1)
+                data.rots = rots / (rots.norm(dim=-1, keepdim=True) + 1e-6)
 
     return data
 
@@ -124,8 +168,6 @@ class KITTI360GS(BaseDataset):
     _trainval_zip_name = DATA_3D_SEMANTICS_ZIP_NAME
     _test_zip_name = DATA_3D_SEMANTICS_TEST_ZIP_NAME
     _unzip_name = UNZIP_NAME
-    
-    _gs_path = GS_PATH
 
     @property
     def class_names(self):
@@ -195,6 +237,151 @@ class KITTI360GS(BaseDataset):
                         └── {{start_frame:0>10}}_{{end_frame:0>10}}.ply
             """
 
+    def download_dataset(self):
+        """Download the KITTI-360 dataset.
+        """
+        # Name of the downloaded dataset zip
+        zip_name = self._test_zip_name if self.stage == 'test' \
+            else self._trainval_zip_name
+
+        # Accumulated 3D point clouds with annotations
+        if not osp.exists(osp.join(self.root, zip_name)):
+            if self.stage != 'test':
+                msg = 'Accumulated Point Clouds for Train & Val (12G)'
+            else:
+                msg = 'Accumulated Point Clouds for Test (1.2G)'
+            log.error(
+                f"\nKITTI-360 does not support automatic download.\n"
+                f"Please go to the official webpage {self._form_url}, "
+                f"manually download the '{msg}' (i.e. '{zip_name}') to your "
+                f"'{self.root}/' directory, and re-run.\n"
+                f"The dataset will automatically be unzipped into the "
+                f"following structure:\n"
+                f"{self.raw_file_structure}\n")
+            sys.exit(1)
+
+        # Unzip the file and place its content into the expected data
+        # structure inside `root/raw/` directory
+        extract_zip(osp.join(self.root, zip_name), self.raw_dir)
+        stage = 'test' if self.stage == 'test' else 'train'
+        seqs = os.listdir(osp.join(self.raw_dir, 'data_3d_semantics', stage))
+        for seq in seqs:
+            source = osp.join(self.raw_dir, 'data_3d_semantics', stage, seq)
+            target = osp.join(self.raw_dir, 'data_3d_semantics', seq)
+            shutil.move(source, target)
+        shutil.rmtree(osp.join(self.raw_dir, 'data_3d_semantics', stage))
+
+    def read_single_raw_cloud(self, raw_cloud_path):
+        """Read a single raw cloud and return a `Data` object, ready to
+        be passed to `self.pre_transform`.
+
+        This `Data` object should contain the following attributes:
+          - `pos`: point coordinates
+          - `y`: OPTIONAL point semantic label
+          - `obj`: OPTIONAL `InstanceData` object with instance labels
+          - `rgb`: OPTIONAL point color
+          - `intensity`: OPTIONAL point LiDAR intensity
+
+        IMPORTANT:
+        By convention, we assume `y ∈ [0, self.num_classes-1]` ARE ALL
+        VALID LABELS (i.e. not 'ignored', 'void', 'unknown', etc),
+        while `y < 0` AND `y >= self.num_classes` ARE VOID LABELS.
+        This applies to both `Data.y` and `Data.obj.y`.
+        """
+        return read_kitti360gs_window(
+            raw_cloud_path, semantic=True, instance=True, remap=True)
+
+    def id_to_relative_raw_path(self, id):
+        """Given a cloud id as stored in `self.cloud_ids`, return the
+        path (relative to `self.raw_dir`) of the corresponding raw
+        cloud.
+        """
+        id = self.id_to_base_id(id)
+        return osp.join(
+            'data_3d_semantics', id.split(os.sep)[0], 'static',
+            id.split(os.sep)[1] + '.ply')
+    
+    def processed_to_raw_path(self, processed_path):
+        """Return the raw cloud path corresponding to the input
+        processed path.
+        """
+        # Extract useful information from <path>
+        stage, hash_dir, sequence_name, cloud_id = \
+            osp.splitext(processed_path)[0].split(os.sep)[-4:]
+
+        # Remove the tiling in the cloud_id, if any
+        base_cloud_id = self.id_to_base_id(cloud_id)
+
+        # Read the raw cloud data
+        raw_path = osp.join(
+            self.raw_dir, 'data_3d_semantics', sequence_name, 'static',
+            base_cloud_id + '.ply')
+
+        return raw_path
+    
+    def make_submission(self, idx, pred, pos, submission_dir=None):
+        """Prepare data for a sumbission to KITTI360 for 3D semantic
+        Segmentation on the test set.
+
+        Expected submission format is detailed here:
+        https://github.com/autonomousvision/kitti360Scripts/tree/master/kitti360scripts/evaluation/semantic_3d
+        """
+        if self.xy_tiling or self.pc_tiling:
+            raise NotImplementedError(
+                f"Submission generation not implemented for tiled KITTI360 "
+                f"datasets yet...")
+
+        # Make sure the prediction is a 1D tensor
+        if pred.dim() != 1:
+            raise ValueError(
+                f'The submission predictions must be 1D tensors, '
+                f'received {type(pred)} of shape {pred.shape} instead.')
+
+        # TODO:
+        #  - handle tiling
+        #  - handle geometric transformations of test data, shuffling of points and of tiles in the dataloader
+        #  - handle multiple tiles in the dataloader...
+        # Initialize the submission directory
+        submission_dir = submission_dir or self.submission_dir
+        if not osp.exists(submission_dir):
+            os.makedirs(submission_dir)
+
+        # Read the raw point cloud
+        raw_path = osp.join(
+            self.raw_dir, self.id_to_relative_raw_path(self.cloud_ids[idx]))
+        data_raw = self.sanitized_read_single_raw_cloud(raw_path)
+
+        # Search the nearest neighbor of each point and apply the
+        # neighbor's class to the points
+        neighbors = knn_2(pos, data_raw.pos, 1, r_max=1)[0]
+        pred_raw = pred[neighbors]
+
+        # Map TrainId labels to expected Ids
+        pred_raw = np.asarray(pred_raw)
+        pred_remapped = TRAINID2ID[pred_raw].astype(np.uint8)
+
+        # Recover sequence and window information from stage dataset's
+        # windows and format those to match the expected file name:
+        # {seq:0>4}_{start_frame:0>10}_{end_frame:0>10}.npy
+        sequence_name, window_name = self.id_to_base_id(
+            self.cloud_ids[idx]).split(os.sep)
+        seq = sequence_name.split('_')[-2]
+        start_frame, end_frame = window_name.split('_')
+        filename = f'{seq:0>4}_{start_frame:0>10}_{end_frame:0>10}.npy'
+
+        # Save the window submission
+        np.save(osp.join(submission_dir, filename), pred_remapped)
+
+    def finalize_submission(self, submission_dir):
+        """This should be called once all window submission files have
+        been saved using `self._make_submission`. This will zip them
+        together as expected by the KITTI360 submission server.
+        """
+        zipObj = ZipFile(f'{submission_dir}.zip', 'w')
+        for p in glob.glob(osp.join(submission_dir, '*.npy')):
+            zipObj.write(p)
+        zipObj.close()
+
     def process(self):
         # If some stages have mixed clouds (they rely on the same cloud
         # files and the split is operated at reading time by
@@ -248,6 +435,14 @@ class KITTI360GS(BaseDataset):
             tile = self.get_tile_from_path(cloud_path)[0]
             data = SampleRecursiveMainXYAxisTiling(x=tile[0], steps=tile[1])(data)
 
+        nag = NAG([data])
+        torch.save(nag, cloud_path.replace(".h5", "_before.pt"))
+        # nag.save(
+        #     cloud_path.replace(".h5", "_before.h5"),
+        #     y_to_csr=self.save_y_to_csr,
+        #     pos_dtype=self.save_pos_dtype,
+        #     fp_dtype=self.save_fp_dtype)
+
         # Apply pre_transform
         if self.pre_transform is not None:
             nag = self.pre_transform(data)
@@ -271,6 +466,7 @@ class KITTI360GS(BaseDataset):
         #  that they contain no '-1' empty neighborhoods, because if
         #  you load them for batching, the pyg reindexing mechanism will
         #  break indices will not index update
+        torch.save(nag, cloud_path.replace(".h5", ".pt"))
         nag.save(
             cloud_path,
             y_to_csr=self.save_y_to_csr,

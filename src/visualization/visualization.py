@@ -151,16 +151,6 @@ def visualize_3d(
     # If the input is a simple Data object, we convert it to a NAG
     input = NAG([input]) if isinstance(input, Data) else input
 
-    # If the last level of the NAG has super_index, we manually
-    # construct an additional Data level and append it to the NAG
-    if input[input.num_levels - 1].is_sub:
-        data_last = input[input.num_levels - 1]
-        sub = Cluster(
-            data_last.super_index, torch.arange(data_last.num_nodes),
-            dense=True)
-        obj = data_last.obj.merge(data_last.super_index)
-        pos = scatter_mean(data_last.pos, data_last.super_index, dim=0)
-        input = NAG(input.to_list() + [Data(pos=pos, sub=sub, obj=obj)])
     is_nag = isinstance(input, NAG)
     num_levels = input.num_levels if is_nag else 1
 
@@ -169,76 +159,9 @@ def visualize_3d(
     alpha_super = max(0, min(alpha_super, 1)) if alpha_super else alpha
     alpha_stuff = max(0, min(alpha_stuff, 1)) if alpha_stuff else alpha
 
-    # If `radius` is provided, we only visualize a spherical selection
-    # of size `radius` around the `center`
-    if radius is not None:
-        # If no `center` provided, pick the middle of the scene
-        if center is None:
-            hi = input[0].pos.max(dim=0).values
-            lo = input[0].pos.min(dim=0).values
-            center = (hi + lo) / 2
-
-            # For Z, we center on the average Z, because the middle
-            # value may cause empty samplings for outdoor scenes with
-            # some very high objects and most of the interesting stuff
-            # happening near the ground 
-            center[2] = input[0].pos[:, 2].mean()
-        else:
-            center = torch.as_tensor(center).cpu()
-        center = center.view(1, -1)
-
-        # Create a mask on level-0 (ie points) to be used for indexing
-        # the NAG structure
-        mask = torch.where(
-            torch.linalg.norm(input[0].pos - center, dim=1) < radius)[0]
-
-        # Subselect the hierarchical partition based on the level-0 mask
-        input = input.select(0, mask)
-
-    # If `select` is provided, we will call NAG.select on the input data
-    # and illustrate the selected/discarded pattern in the figure
-    if select is not None and is_nag:
-
-        # Add an ID to the points before applying NAG.select
-        nag_temp = input.clone()
-        for i in range(nag_temp.num_levels):
-            nag_temp._list[i] = SaveNodeIndex()(nag_temp[i])
-
-        # Apply the selection
-        nag_temp = nag_temp.select(*select)
-
-        # Indicate, for each node of the hierarchical graph, whether it
-        # has been selected
-        for i in range(num_levels):
-            selected = torch.zeros(input[i].num_nodes, dtype=torch.bool)
-            selected[nag_temp[i][SaveNodeIndex.DEFAULT_KEY]] = True
-            input[i].selected = selected
-
-        del nag_temp, selected
-
-    elif select is not None and not is_nag:
-
-        # Add an ID to the points before applying NAG.select
-        data_temp = SaveNodeIndex()(Data(pos=input.pos.clone()))
-
-        # Apply the selection
-        data_temp = data_temp.select(select)[0]
-
-        # Indicate, for each node of the hierarchical graph, whether it
-        # has been selected
-        selected = torch.zeros(input.num_nodes, dtype=torch.bool)
-        selected[data_temp[SaveNodeIndex.DEFAULT_KEY]] = True
-        input.selected = selected
-
-        del data_temp, selected
-
-    elif is_nag:
-        for i in range(num_levels):
-            input[i].selected = torch.ones(
-                input[i].num_nodes, dtype=torch.bool)
-
-    else:
-        input.selected = torch.ones(input.num_nodes, dtype=torch.bool)
+    for i in range(num_levels):
+        input[i].selected = torch.ones(
+            input[i].num_nodes, dtype=torch.bool)
 
     # Data_0 accounts for the lowest level of hierarchy, the points
     # themselves
@@ -251,16 +174,6 @@ def visualize_3d(
     # without replacement. To keep track of the sampled points and index
     # the NAG accordingly, we use 'SaveNodeIndex'
     idx = torch.arange(data_0.num_points)
-
-    # If a voxel size is specified, voxelize the level-0. We first
-    # isolate the 'pos' and the input indices of data_0 and apply
-    # voxelization on this. We then recover the original grid-sampled
-    # points indices to be used with Data.select or NAG.select
-    if voxel > 0:
-        data_temp = SaveNodeIndex()(Data(pos=data_0.pos.clone()))
-        data_temp = GridSampling3D(voxel, mode='last')(data_temp)
-        idx = data_temp[SaveNodeIndex.DEFAULT_KEY]
-        del data_temp
 
     # If the cloud is too large with respect to required 'max_points',
     # sample without replacement
@@ -275,13 +188,8 @@ def visualize_3d(
 
     # Round to the cm for cleaner hover info
     data_0.pos = (data_0.pos * 100).round() / 100
-
-    # Class colors initialization
-    if class_colors is not None and not isinstance(class_colors[0], str):
-        class_colors = np.asarray(class_colors)
-    else:
-        class_colors = None
-
+    print(data_0.pos.shape)
+    
     # Prepare figure
     width = width if width and height else figsize
     height = height if width and height else int(figsize / 2)
@@ -357,239 +265,6 @@ def visualize_3d(
         trace_modes[i_unselected_point_trace]['RGB'] = {
             'marker.color': colors[~data_0.selected], 'hovertext': None}
 
-    # Color the points with ground truth semantic labels. If labels are
-    # expressed as histograms, keep the most frequent one
-    if data_0.y is not None:
-        y = data_0.y
-        y = y.argmax(1).numpy() if y.dim() == 2 else y.numpy()
-        colors = class_colors[y] if class_colors is not None \
-            else int_to_plotly_rgb(torch.LongTensor(y))
-        data_0.y_colors = colors
-        if class_names is None:
-            text = np.array([f"Class {i}" for i in range(y.max() + 1)])
-        else:
-            text = np.array([str.title(c) for c in class_names])
-        text = text[y]
-        trace_modes[i_point_trace]['Semantic'] = {
-            'marker.color': colors[data_0.selected],
-            'hovertext': text[data_0.selected]}
-        trace_modes[i_unselected_point_trace]['Semantic'] = {
-            'marker.color': colors[~data_0.selected],
-            'hovertext': text[~data_0.selected]}
-
-    # Color the points with predicted semantic labels. If labels are
-    # expressed as histograms, keep the most frequent one
-    if data_0.semantic_pred is not None:
-        pred = data_0.semantic_pred
-        pred = pred.argmax(1).numpy() if pred.dim() == 2 else pred.numpy()
-
-        # If the ground truth labels are available, we use them to
-        # identify void points in the predictions
-        if data_0.y is not None and hide_void_pred:
-            # Get the target label
-            y_gt = data_0.y
-            y_gt = y_gt.argmax(1) if y_gt.dim() == 2 else y_gt
-
-            # Create a mask over the points identifying those whose
-            # ground truth label is void
-            is_void = np.zeros(y_gt.max() + 1, dtype='bool')
-            void_classes = [num_classes] if num_classes else []
-            for i in void_classes:
-                if i < is_void.shape[0]:
-                    is_void[i] = True
-            is_void = is_void[y_gt]
-
-            # Set the predicted label to void if the ground truth is
-            # void, this avoids visualizing predictions on void
-            # labels
-            pred[is_void] = y_gt[is_void]
-
-        colors = class_colors[pred] if class_colors is not None else None
-        data_0.pred_colors = colors
-        if class_names is None:
-            text = np.array([f"Class {i}" for i in range(pred.max() + 1)])
-        else:
-            text = np.array([str.title(c) for c in class_names])
-        text = text[pred]
-        trace_modes[i_point_trace]['Semantic Pred.'] = {
-            'marker.color': colors[data_0.selected],
-            'hovertext': text[data_0.selected]}
-        trace_modes[i_unselected_point_trace]['Semantic Pred.'] = {
-            'marker.color': colors[~data_0.selected],
-            'hovertext': text[~data_0.selected]}
-
-    # Color the points with ground truth instance labels. If semantic
-    # labels and stuff_classes/void_classes also passed, the stuff/void
-    # annotations will be treated accordingly
-    if data_0.obj is not None and (class_names is None or data_0.y is None):
-        obj = data_0.obj if isinstance(data_0.obj, torch.Tensor) \
-            else data_0.obj.major(num_classes=num_classes)[0]
-        colors = int_to_plotly_rgb(obj)
-        data_0.obj_colors = colors
-        text = np.array([f"Object {o}" for o in obj])
-        trace_modes[i_point_trace]['Panoptic'] = {
-            'marker.color': colors[data_0.selected],
-            'hovertext': text[data_0.selected]}
-        trace_modes[i_unselected_point_trace]['Panoptic'] = {
-            'marker.color': colors[~data_0.selected],
-            'hovertext': text[~data_0.selected]}
-    elif data_0.obj is not None:
-        # Colors and text for thing points
-        obj = data_0.obj.major(num_classes=num_classes)[0]
-        colors_thing = int_to_plotly_rgb(obj)
-        text_thing = np.array([f"Object {o}" for o in obj])
-
-        # For simplicity, we merge void_classes into the stuff_classes,
-        # the expected behavior is the same, except that we will ensure
-        # that the hover text distinguishes between stuff and void
-        stuff_classes = stuff_classes if stuff_classes is not None else []
-        void_classes = [num_classes] if num_classes else []
-        stuff_classes = list(set(stuff_classes).union(set(void_classes)))
-
-        # Colors and text for stuff points
-        y = data_0.y
-        y = y.argmax(1).numpy() if y.dim() == 2 else y.numpy()
-        colors_stuff = class_colors[y] if class_colors is not None \
-            else int_to_plotly_rgb(torch.LongTensor(y))
-        if class_names is None:
-            text_stuff = np.array([
-                f"{'Void' if i in void_classes else 'Stuff'} - Class {i}"
-                for i in range(y.max() + 1)])
-        else:
-            text_stuff = np.array([
-                f"{'Void' if i in void_classes else 'Stuff'} - {str.title(c)}"
-                for i, c in enumerate(class_names)])
-        text_stuff = text_stuff[y]
-
-        # Apply alpha-whitening on stuff points
-        colors_stuff = colors_stuff.astype('float')
-        white = np.full((colors_stuff.shape[0], 3), 255, dtype='float')
-        colors_stuff = colors_stuff * alpha_stuff + white * (1 - alpha_stuff)
-        colors_stuff = colors_stuff.astype('int64')
-
-        # Compute mask for stuff points
-        stuff_classes = np.asarray([i for i in stuff_classes if i <= y.max()])
-        is_stuff = np.zeros(y.max() + 1, dtype='bool')
-        for i in stuff_classes:
-            if i < is_stuff.shape[0]:
-                is_stuff[i] = True
-        is_stuff = is_stuff[y]
-
-        # Merge thing and stuff colors and text
-        colors = colors_thing
-        text = text_thing
-        colors[is_stuff] = colors_stuff[is_stuff]
-        text[is_stuff] = text_stuff[is_stuff]
-        data_0.obj_colors = colors
-
-        # Create trace modes
-        trace_modes[i_point_trace]['Panoptic'] = {
-            'marker.color': colors[data_0.selected],
-            'hovertext': text[data_0.selected]}
-        trace_modes[i_unselected_point_trace]['Panoptic'] = {
-            'marker.color': colors[~data_0.selected],
-            'hovertext': text[~data_0.selected]}
-
-    # Color the points with predicted instance labels. If semantic
-    # labels and stuff_classes/void_classes also passed, the
-    # stuff/void predictions will be treated accordingly. This
-    # expects `data_0.obj_pred` to be an InstanceData object
-    if getattr(data_0, 'obj_pred', None) is not None and class_names is None:
-        obj, _, y = data_0.obj_pred.major(num_classes=num_classes)
-        colors = int_to_plotly_rgb(obj)
-        data_0.obj_pred_colors = colors
-        text = np.array([f"Object {o}" for o in obj])
-        trace_modes[i_point_trace]['Panoptic Pred.'] = {
-            'marker.color': colors[data_0.selected],
-            'hovertext': text[data_0.selected]}
-        trace_modes[i_unselected_point_trace]['Panoptic Pred.'] = {
-            'marker.color': colors[~data_0.selected],
-            'hovertext': text[~data_0.selected]}
-    elif getattr(data_0, 'obj_pred', None) is not None:
-        # Colors and text for thing points
-        obj, _, y = data_0.obj_pred.major(num_classes=num_classes)
-        colors_thing = int_to_plotly_rgb(obj)
-        text_thing = np.array([f"Object {o}" for o in obj])
-
-        # For simplicity, we merge void_classes into the stuff_classes,
-        # the expected behavior is the same, except that we will ensure
-        # that the hover text distinguishes between stuff and void
-        stuff_classes = stuff_classes if stuff_classes is not None else []
-        void_classes = [num_classes] if num_classes else []
-        stuff_classes = list(set(stuff_classes).union(set(void_classes)))
-
-        # If the ground truth labels are available, we use them to
-        # identify void points in the predictions
-        if data_0.y is not None and hide_void_pred:
-            # Get the target label
-            y_gt = data_0.y
-            y_gt = y_gt.argmax(1) if y_gt.dim() == 2 else y_gt
-
-            # Create a mask over the points identifying those whose
-            # ground truth label is void
-            is_void = np.zeros(y_gt.max() + 1, dtype='bool')
-            for i in void_classes:
-                if i < is_void.shape[0]:
-                    is_void[i] = True
-            is_void = is_void[y_gt]
-
-            # Set the predicted label to void if the ground truth is
-            # void, this avoids visualizing predictions on void
-            # labels
-            y[is_void] = y_gt[is_void]
-
-        # Colors and text for stuff points
-        colors_stuff = class_colors[y] if class_colors is not None \
-            else int_to_plotly_rgb(torch.LongTensor(y))
-        if class_names is None:
-            text_stuff = np.array([
-                f"{'Void' if i in void_classes else 'Stuff'} - Class {i}"
-                for i in range(y.max() + 1)])
-        else:
-            text_stuff = np.array([
-                f"{'Void' if i in void_classes else 'Stuff'} - {str.title(c)}"
-                for i, c in enumerate(class_names)])
-        text_stuff = text_stuff[y]
-
-        # Apply alpha-whitening on stuff points
-        colors_stuff = colors_stuff.astype('float')
-        white = np.full((colors_stuff.shape[0], 3), 255, dtype='float')
-        colors_stuff = colors_stuff * alpha_stuff + white * (1 - alpha_stuff)
-        colors_stuff = colors_stuff.astype('int64')
-
-        # Compute mask for stuff points
-        stuff_classes = np.asarray([i for i in stuff_classes if i <= y.max()])
-        is_stuff = np.zeros(y.max() + 1, dtype='bool')
-        for i in stuff_classes:
-            if i < is_stuff.shape[0]:
-                is_stuff[i] = True
-        is_stuff = is_stuff[y]
-
-        # Merge thing and stuff colors and text
-        colors = colors_thing
-        text = text_thing
-        colors[is_stuff] = colors_stuff[is_stuff]
-        text[is_stuff] = text_stuff[is_stuff]
-        data_0.obj_pred_colors = colors
-
-        # Create trace modes
-        trace_modes[i_point_trace]['Panoptic Pred.'] = {
-            'marker.color': colors[data_0.selected],
-            'hovertext': text[data_0.selected]}
-        trace_modes[i_unselected_point_trace]['Panoptic Pred.'] = {
-            'marker.color': colors[~data_0.selected],
-            'hovertext': text[~data_0.selected]}
-
-    # Draw a trace for 3D point cloud features
-    if data_0.x is not None:
-        colors = feats_to_plotly_rgb(
-            data_0.x, normalize=True, colorscale=colorscale)
-        data_0.x_colors = colors
-        trace_modes[i_point_trace]['Features 3D'] = {
-            'marker.color': colors[data_0.selected], 'hovertext': None}
-        trace_modes[i_unselected_point_trace]['Features 3D'] = {
-            'marker.color': colors[~data_0.selected], 'hovertext': None}
-
     # Draw a trace for each key specified in keys
     if keys is None:
         keys = []
@@ -604,17 +279,6 @@ def visualize_3d(
                 'marker.color': colors[data_0.selected], 'hovertext': None}
             trace_modes[i_unselected_point_trace][str(key).title()] = {
                 'marker.color': colors[~data_0.selected], 'hovertext': None}
-
-    # Draw a trace for 3D point cloud sampling (for sampling debugging)
-    if 'super_sampling' in data_0.keys:
-        colors = data_0.super_sampling
-        colors = int_to_plotly_rgb(colors)
-        colors[data_0.super_sampling == -1] = 230
-        data_0.super_sampling_colors = colors
-        trace_modes[i_point_trace]['Super sampling'] = {
-            'marker.color': colors[data_0.selected], 'hovertext': None}
-        trace_modes[i_unselected_point_trace]['Super sampling'] = {
-            'marker.color': colors[~data_0.selected], 'hovertext': None}
 
     # Draw a trace for each cluster level
     for i_level, data_i in enumerate(input if is_nag else []):

@@ -3,7 +3,7 @@ import numpy as np
 from sklearn.linear_model import RANSACRegressor
 import pgeof
 from src.utils import rgb2hsv, rgb2lab, sizes_to_pointers, to_float_rgb, \
-    POINT_FEATURES, sanitize_keys
+    POINT_FEATURES, sanitize_keys, qvec2rotmat
 from src.transforms import Transform
 from src.data import NAG
 
@@ -54,10 +54,8 @@ class PointFeaturesGS(Transform):
     def __init__(
             self,
             keys=None,
-            gs_path="/workspace/gaussian_splatting/output",
             overwrite=True):
         self.keys = sanitize_keys(keys, default=POINT_FEATURES)
-        self.gs_path = gs_path
         self.overwrite = overwrite
 
     def _process(self, data):
@@ -111,95 +109,75 @@ class PointFeaturesGS(Transform):
             k = data.neighbor_index.ge(0).sum(dim=1)
             data.density = (k / dmax ** 2).view(-1, 1)
 
-        # Add local geometric features
-        needs_geof = any((
-            'linearity' in keys,
-            'planarity' in keys,
-            'scattering' in keys,
-            'verticality' in keys,
-            'normal' in keys))
-        if needs_geof and data.pos is not None:
+        device = data.pos.device
 
-            # Prepare data for numpy boost interface. Note: we add each
-            # point to its own neighborhood before computation
-            device = data.pos.device
-            xyz = data.pos.cpu().numpy()
-            nn = torch.cat(
-                (torch.arange(xyz.shape[0]).view(-1, 1), data.neighbor_index),
-                dim=1)
-            k = nn.shape[1]
+        f = self.compute_feature_gs(data)
 
-            # Check for missing neighbors (indicated by -1 indices)
-            n_missing = (nn < 0).sum(dim=1)
-            if (n_missing > 0).any():
-                sizes = k - n_missing
-                nn = nn[nn >= 0]
-                nn_ptr = sizes_to_pointers(sizes.cpu())
-            else:
-                nn = nn.flatten().cpu()
-                nn_ptr = torch.arange(xyz.shape[0] + 1) * k
-            nn = nn.numpy().astype('uint32')
-            nn_ptr = nn_ptr.numpy().astype('uint32')
+        # Keep only required features
+        if 'linearity' in keys:
+            data.linearity = f[:, 0].view(-1, 1).to(device)
 
-            # Make sure array are contiguous before moving to C++
-            xyz = np.ascontiguousarray(xyz)
-            nn = np.ascontiguousarray(nn)
-            nn_ptr = np.ascontiguousarray(nn_ptr)
+        if 'planarity' in keys:
+            data.planarity = f[:, 1].view(-1, 1).to(device)
 
-            # C++ geometric features computation on CPU
-            # if self.k_step < 0:
-            #     f = pgeof.compute_features(
-            #         xyz, 
-            #         nn, 
-            #         nn_ptr, 
-            #         self.k_min, 
-            #         verbose=False)
-            # else:
-            #     f = pgeof.compute_features_optimal(
-            #         xyz,
-            #         nn,
-            #         nn_ptr,
-            #         self.k_min,
-            #         self.k_step,
-            #         self.k_min_search,
-            #         verbose=False)
-            f = torch.from_numpy(f)
+        if 'scattering' in keys:
+            data.scattering = f[:, 2].view(-1, 1).to(device)
 
-            # Keep only required features
-            if 'linearity' in keys:
-                data.linearity = f[:, 0].view(-1, 1).to(device)
+        # Heuristic to increase importance of verticality in
+        # partition
+        if 'verticality' in keys:
+            data.verticality = f[:, 3].view(-1, 1).to(device)
+            data.verticality *= 2
 
-            if 'planarity' in keys:
-                data.planarity = f[:, 1].view(-1, 1).to(device)
+        if 'curvature' in keys:
+            data.curvature = f[:, 10].view(-1, 1).to(device)
 
-            if 'scattering' in keys:
-                data.scattering = f[:, 2].view(-1, 1).to(device)
+        if 'length' in keys:
+            data.length = f[:, 7].view(-1, 1).to(device)
 
-            # Heuristic to increase importance of verticality in
-            # partition
-            if 'verticality' in keys:
-                data.verticality = f[:, 3].view(-1, 1).to(device)
-                data.verticality *= 2
+        if 'surface' in keys:
+            data.surface = f[:, 8].view(-1, 1).to(device)
 
-            if 'curvature' in keys:
-                data.curvature = f[:, 10].view(-1, 1).to(device)
+        if 'volume' in keys:
+            data.volume = f[:, 9].view(-1, 1).to(device)
 
-            if 'length' in keys:
-                data.length = f[:, 7].view(-1, 1).to(device)
-
-            if 'surface' in keys:
-                data.surface = f[:, 8].view(-1, 1).to(device)
-
-            if 'volume' in keys:
-                data.volume = f[:, 9].view(-1, 1).to(device)
-
-            # As a way to "stabilize" the normals' orientation, we
-            # choose to express them as oriented in the z+ half-space
-            if 'normal' in keys:
-                data.normal = f[:, 4:7].view(-1, 3).to(device)
-                data.normal[data.normal[:, 2] < 0] *= -1
+        # As a way to "stabilize" the normals' orientation, we
+        # choose to express them as oriented in the z+ half-space
+        if 'normal' in keys:
+            data.normal = f[:, 4:7].view(-1, 3).to(device)
+            data.normal[data.normal[:, 2] < 0] *= -1
 
         return data
+    
+    def compute_feature_gs(self, data):
+        eps = 1e-3
+        scales_idx = torch.argsort(-data.scales)
+        l1 = data.scales[torch.arange(data.scales.size(0)), scales_idx[:,0]]
+        l2 = data.scales[torch.arange(data.scales.size(0)), scales_idx[:,1]]
+        l3 = data.scales[torch.arange(data.scales.size(0)), scales_idx[:,2]]
+        
+        rotmats = torch.zeros(data.scales.size(0), 3, 3).to(data.scales.device)
+        for i in range(data.scales.size(0)):
+            rotmats[i] = qvec2rotmat(data.rots[i])
+        
+        v1 = rotmats[torch.arange(data.scales.size(0)), :, scales_idx[:,0]]
+        v2 = rotmats[torch.arange(data.scales.size(0)), :, scales_idx[:,1]]
+        v3 = rotmats[torch.arange(data.scales.size(0)), :, scales_idx[:,2]]
+        
+        abs_vector = l1.view(-1,1) * abs(v1) + l2.view(-1,1) * abs(v2) + l3.view(-1,1) * abs(v3)
+        
+        f = torch.zeros(data.scales.size(0), 11).to(data.scales.device)
+        f[:, 0] = (l1 - l2) / (l1 + eps)
+        f[:, 1] = (l2 - l3) / (l1 + eps)
+        f[:, 2] = l3 / (l1 + eps)
+        f[:, 3] = abs_vector[:, 2] / (torch.norm(abs_vector, dim=1) + eps)
+        f[:, 4:7] = v3
+        f[:, 7] = l1
+        f[:, 8] = (l1 * l2 + eps * eps) ** 0.5
+        f[:, 9] = (l1 * l2 * l3 + eps * eps * eps) ** (1/3)
+        f[:, 10] = l2 / (l1 + l2 + l3 + eps)
+        
+        return f
 
 class PointFeatures(Transform):
     """Compute pointwise features based on what is already available in
@@ -431,7 +409,12 @@ class GroundElevation(Transform):
 
         # To avoid capturing high above-ground flat structures, we only
         # keep points which are within `threshold` of the lowest point.
-        idx_low = np.where(pos[:, 2] - pos[:, 2].min() < self.threshold)[0]
+        # while True:
+        #     idx_low = np.where(pos[:, 2] - pos[:, 2].min() < self.threshold)[0]
+        #     if len(idx_low) < 3:
+        #         self.threshold *= 2
+        #     else:
+        #         break
 
         # Search the ground plane using RANSAC
         ransac = RANSACRegressor(random_state=0, residual_threshold=1e-3).fit(
