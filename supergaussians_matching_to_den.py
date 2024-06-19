@@ -1,6 +1,5 @@
 import os
 import sys
-from tqdm import tqdm
 
 # Add the project's files to the python path
 # file_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # for .py script
@@ -31,30 +30,8 @@ for scene_name in scene_name_list:
     input_pt = PlyData.read(f"/workspace/gaussian-splatting/output/{scene_name}_4/input.ply")
     output_path = f"/workspace/superpoint_transformer/supergaussians/{scene_name}.ply"
 
-    input_x = input_pt["vertex"]["x"]
-    input_y = input_pt["vertex"]["y"]
-    input_z = input_pt["vertex"]["z"]
-    output_x = input_pt["vertex"]["x"]
-    output_y = input_pt["vertex"]["y"]
-    output_z = input_pt["vertex"]["z"]
 
-    input_xyz = np.stack((input_x, input_y, input_z), axis=1)
-    output_xyz = np.stack((output_x, output_y, output_z), axis=1)
-
-    match_xyz = []
-    for cur_xyz in tqdm(input_xyz):
-        distance = np.linalg.norm(output_xyz - cur_xyz, axis=1)
-        nearest_idx = np.argmin(distance)
-        match_xyz.append(nearest_idx)
-    # print(match_xyz)
-
-    diff_cnt = 0
-    for a, b in enumerate(match_xyz):
-        if a!=b:
-            diff_cnt += 1
-    print(diff_cnt)
-
-    pt_num_points = int(np.shape(input_pt["vertex"]["x"])[0])
+    pt_num_points = np.shape(input_pt["vertex"]["x"])
     print(f"Num of Points(Input): {pt_num_points}")
 
     num_points = int(nag[0].sub.num_points)
@@ -65,20 +42,20 @@ for scene_name in scene_name_list:
     level_dict = []
     for i_level, data in enumerate(nag):
         level_dict.append({})
-        for cluster_idx in tqdm(range(len(nag[i_level].sub))):
+        for cluster_idx in range(len(nag[i_level].sub)):
             cluster = nag[i_level].sub[cluster_idx]
             for point in cluster.points:
                 level_dict[i_level][int(point)] = cluster_idx
                 
     colors = []
     C = 0.28209479177387814
-    for i in tqdm(range(num_points)):
+    for i in range(num_points):
         r,g,b = ColorHash(i).rgb
         colors.append(((r/255.0 - 0.5)/C, (g/255.0 - 0.5)/C, (b/255.0 - 0.5)/C))
             
     cluster_dict = {}
     color_dict = {}
-    for point_idx in tqdm(range(num_points)):
+    for point_idx in range(num_points):
         level_0 = level_dict[0][point_idx]
         level_1 = level_dict[1][level_0]
         level_2 = level_dict[2][level_1]
@@ -101,38 +78,34 @@ for scene_name in scene_name_list:
     for name in f_rest_names:
         pt['vertex'][name] = np.zeros_like(pt['vertex'][name])
 
-    x = input_pt['vertex']['x']
-    y = input_pt['vertex']['y']
-    z = input_pt['vertex']['z']
+    x = pt['vertex']['x']
+    y = pt['vertex']['y']
+    z = pt['vertex']['z']
     xyz = np.stack((x, y, z), axis=1)
     normals = np.zeros_like(xyz)
 
-    f_rest = np.zeros((pt_num_points, len(f_rest_names)))
+    f_rest = np.zeros((num_points, len(f_rest_names)))
         
-    opacities = np.zeros((pt_num_points, 1))
-    for idx in range(pt_num_points):
-        opacities[idx][0] = pt['vertex']['opacity'][match_xyz[idx]]
+    opacities = pt['vertex']['opacity'].reshape(-1, 1)
 
-    scale = np.zeros((pt_num_points, len(scales_names)))
+    scale = np.zeros((num_points, len(scales_names)))
     for name in scales_names:
-        for idx in range(pt_num_points):
-            scale[idx][int(name.split('_')[-1])] = pt['vertex'][name][match_xyz[idx]]
+        scale[:, int(name.split('_')[-1])] = pt['vertex'][name]
         
-    rotation = np.zeros((pt_num_points, len(rot_names)))
+    rotation = np.zeros((num_points, len(rot_names)))
     for name in rot_names:
-        for idx in range(pt_num_points):
-            rotation[idx][int(name.split('_')[-1])] = pt['vertex'][name][match_xyz[idx]]
+        rotation[:, int(name.split('_')[-1])] = pt['vertex'][name]
 
     for level in range(4):
-        f_dc = np.zeros((pt_num_points, len(f_dc_names)))
+        f_dc = np.zeros((num_points, len(f_dc_names)))
         for i, name in enumerate(f_dc_names):
-            new_dc = np.zeros((pt_num_points))
-            for j in range(pt_num_points):
-                new_dc[j] = color_dict[match_xyz[j]][level][i]
+            new_dc = np.zeros_like(pt['vertex'][name])
+            for j in range(num_points):
+                new_dc[j] = color_dict[j][level][i]
             f_dc[:, i] = new_dc
         
         dtype_full = [(attribute.name, 'f4') for attribute in attributes_names]
-        elements = np.empty(pt_num_points, dtype=dtype_full)
+        elements = np.empty(num_points, dtype=dtype_full)
         attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation), axis=1)
         elements[:] = list(map(tuple, attributes))
         el = PlyElement.describe(elements, 'vertex')
